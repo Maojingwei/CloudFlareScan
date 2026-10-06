@@ -1,0 +1,98 @@
+name: Build Android APK
+
+# 官方打包工具 pyside6-android-deploy 只支持 Linux/macOS 主机，
+# 所以放到 Ubuntu runner 上构建，本机不需要安装任何 Android 工具链。
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 目标架构
+        required: true
+        default: aarch64
+        type: choice
+        options: [aarch64, x86_64]
+      mode:
+        description: debug 产出 apk / release 产出 aab
+        required: true
+        default: debug
+        type: choice
+        options: [debug, release]
+  push:
+    tags:
+      - 'v*'
+
+env:
+  QTPY_VERSION: '6.10.3'
+  PYSIDE_SETUP_BRANCH: '6.10'
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install host dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "PySide6==${QTPY_VERSION}" Cython buildozer
+
+      # Android SDK/NDK 体积很大（数 GB），缓存后后续构建会快很多
+      - name: Cache Android SDK and NDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.pyside6-android-deploy
+          key: pyside6-android-sdk-ndk-${{ env.QTPY_VERSION }}-v2
+
+      - name: Download Android SDK and NDK
+        run: |
+          set -euo pipefail
+          if [ -d "$HOME/.pyside6-android-deploy" ] && \
+             find "$HOME/.pyside6-android-deploy" -maxdepth 4 -type d -name platform-tools | head -n1 | grep -q .; then
+            echo "已从缓存恢复 SDK/NDK"
+            exit 0
+          fi
+          git clone --depth 1 --branch "${PYSIDE_SETUP_BRANCH}" \
+            https://code.qt.io/pyside/pyside-setup.git "$RUNNER_TEMP/pyside-setup"
+          REQ="$RUNNER_TEMP/pyside-setup/tools/cross_compile_android/requirements.txt"
+          [ -f "$REQ" ] && python -m pip install -r "$REQ" || true
+          python "$RUNNER_TEMP/pyside-setup/tools/cross_compile_android/main.py" \
+            --download-only --skip-update --auto-accept-license
+
+      - name: Cache Qt for Python Android wheels
+        uses: actions/cache@v4
+        with:
+          path: CloudFlareScan/.android-wheels
+          key: pyside6-android-wheels-${{ env.QTPY_VERSION }}-${{ inputs.arch || 'aarch64' }}
+
+      - name: Build APK
+        env:
+          ANDROID_ARCH: ${{ inputs.arch || 'aarch64' }}
+          BUILDOZER_MODE: ${{ inputs.mode || 'debug' }}
+        run: |
+          set -euo pipefail
+          ls "$HOME/.pyside6-android-deploy" || true
+          bash CloudFlareScan/android/build_apk.sh
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudFlareScan-android-${{ inputs.arch || 'aarch64' }}
+          path: |
+            CloudFlareScan/**/*.apk
+            CloudFlareScan/**/*.aab
+          if-no-files-found: error
+          retention-days: 30

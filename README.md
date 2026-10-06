@@ -81,6 +81,53 @@ vless://73bcd72f-9545-4cb8-8daf-7d004501880d@104.17.214.222:443?path=%2F&securit
 python test_node_share.py
 ```
 
-测试覆盖分享链接格式（与样本逐字符比对）、速度筛选、端口处理、IPv6 方括号、Base64 订阅以及弹窗交互。
+测试覆盖分享链接格式（与样本逐字符比对）、速度筛选、端口处理、IPv6 方括号、Base64 订阅、弹窗交互，以及标准库 HTTP 解析与 Android 打包约束。
+
+## 构建 Android 安装包 (APK)
+
+官方工具 [`pyside6-android-deploy`](https://doc.qt.io/qtforpython-6/deployment/deployment-pyside6-android-deploy.html)
+**只支持 Linux / macOS 主机**，因此提供两条路径：
+
+### 方式一：GitHub Actions 云端构建（推荐，本机无需环境）
+
+1. 把本目录推到 GitHub 仓库；
+2. 打开仓库 **Actions → Build Android APK → Run workflow**，选择架构（默认 `aarch64`）；
+3. 构建完成后在该次运行的 **Artifacts** 里下载 `CloudFlareScan-android-aarch64`（内含 APK）。
+
+工作流文件：`.github/workflows/android.yml`。打 tag（`v*`）也会自动触发构建。
+
+流水线做的事：装 JDK 17 → 装 `PySide6==6.10.3` → 下载 Android SDK/NDK 与 Qt for Python Android wheel
+（两者都有缓存）→ 调用 `android/build_apk.sh` 打包 → 上传 APK。
+
+### 方式二：本地 Linux / macOS 构建
+
+前置条件：JDK 17+、`python3`（3.10+）、`git`、`curl`。
+
+```bash
+python3 -m pip install "PySide6==6.10.3"
+cd CloudFlareScan
+bash android/build_apk.sh
+```
+
+脚本会自动下载 Android SDK/NDK（缓存到 `~/.pyside6-android-deploy`，约数 GB，仅首次）、
+下载 Qt for Python Android wheel、生成并修正 `pysidedeploy.spec`，最后产出 APK。
+首次构建需要编译 CPython 与依赖，耗时较长（30 分钟以上）。
+
+常用环境变量：`ANDROID_ARCH`（`aarch64`/`x86_64`）、`BUILDOZER_MODE`（`debug` 出 apk、`release` 出 aab）、
+`ANDROID_NDK_PATH`、`ANDROID_SDK_PATH`。
+
+### Android 适配说明
+
+为让同一份代码能在 Android 上跑起来，做了以下调整（均通过 `IS_ANDROID` 分支隔离，不影响桌面版）：
+
+* **去掉 aiohttp 依赖**：原先只用它发一个 HTTP GET 取地区码，现改为标准库 `asyncio` + `ssl` 实现。
+  这样少掉 aiohttp/multidict/yarl/frozenlist/propcache 等 8 个需要交叉编译的 C 扩展依赖，
+  显著提高 `python-for-android` 打包成功率。
+* **入口文件**：新增 `main.py`（`pyside6-android-deploy` 强制要求入口名为 `main.py`），
+  桌面版与 Android 版共用 `CloudFlareScan.run_app()`。
+* **字体**：Android 使用系统自带 `Noto Sans CJK SC`（`DejaVu Sans` 没有中文字形）。
+* **窗口尺寸**：手机屏幕按 dp 通常仅 360~420 宽，Android 下按钮宽度、Tab 宽度与最小窗口尺寸都会收窄，
+  启动时铺满屏幕；节点分享弹窗的提示文字改为长按提示，避免三列布局挤压。
+* **文件保存**：Android 下默认保存到应用私有目录（无需存储权限），节点分享仍可一键复制到剪贴板。
 
 

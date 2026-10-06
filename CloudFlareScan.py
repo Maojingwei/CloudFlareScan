@@ -3,7 +3,6 @@ import random
 import time
 import ipaddress
 import asyncio
-import aiohttp
 import socket
 import ssl
 from datetime import datetime
@@ -19,14 +18,27 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame, QStackedWidget, QDialog, QDialogButtonBox,
     QCheckBox, QGridLayout
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings, QStandardPaths
 from PySide6.QtGui import QFont, QIcon, QIntValidator, QDoubleValidator
 import os
 import platform
 
 
+def is_android() -> bool:
+    """python-for-android 会设置 ANDROID_ARGUMENT / ANDROID_BOOTLOGO 等环境变量。"""
+    if sys.platform == "android":
+        return True
+    return any(k in os.environ for k in ("ANDROID_ARGUMENT", "ANDROID_BOOTLOGO", "ANDROID_PRIVATE"))
+
+
+IS_ANDROID = is_android()
+
+
 def get_system_font():
     system = platform.system()
+    if IS_ANDROID:
+        # Android 自带 Noto Sans CJK，DejaVu Sans 没有中文字形
+        return "Noto Sans CJK SC"
     if system == "Windows":
         return "Microsoft YaHei"
     elif system == "Darwin":
@@ -34,16 +46,28 @@ def get_system_font():
     else:
         return "DejaVu Sans"
 
+
+def get_default_save_dir() -> str:
+    """Android 只能在应用私有目录下自由写文件（无需存储权限）。"""
+    if IS_ANDROID:
+        for location in (QStandardPaths.AppDataLocation, QStandardPaths.DocumentsLocation):
+            path = QStandardPaths.writableLocation(location)
+            if path:
+                return path
+        return QStandardPaths.writableLocation(QStandardPaths.HomeLocation) or "."
+    return os.path.expanduser("~")
+
 SYSTEM_FONT = get_system_font()
 
-FONT_TITLE = QFont(SYSTEM_FONT, 28)
+FONT_TITLE = QFont(SYSTEM_FONT, 18 if IS_ANDROID else 28)
 FONT_TITLE.setBold(True)
 FONT_BTN = QFont(SYSTEM_FONT, 11)
 FONT_STATUS = QFont(SYSTEM_FONT, 10)
 
-BTN_W = 120
+BTN_W = 88 if IS_ANDROID else 120
 BTN_H = 32
 SPACING = 8
+TAB_BTN_W = 132 if IS_ANDROID else 180
 
 
 LINE_EDIT_STYLE = f"""
@@ -273,32 +297,93 @@ def get_iata_code_from_ip(ip: str, timeout: int = 3) -> Optional[str]:
             continue
     return None
 
-async def get_iata_code_async(session: aiohttp.ClientSession, ip: str, timeout: int = 3) -> Optional[str]:
-    test_host = "speed.cloudflare.com"
-    urls = (f"http://[{ip}]/cdn-cgi/trace", f"https://[{ip}]/cdn-cgi/trace") if ':' in ip else (f"http://{ip}/cdn-cgi/trace", f"https://{ip}/cdn-cgi/trace")
-    headers = {"User-Agent": "Mozilla/5.0", "Host": test_host}
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-    for url in urls:
+def dechunk_body(data: bytes) -> bytes:
+    """解码 HTTP/1.1 chunked 响应体。"""
+    out = bytearray()
+    while data:
+        line, sep, rest = data.partition(b"\r\n")
+        if not sep:
+            break
         try:
-            async with session.get(url, headers=headers, ssl=ssl_ctx if url.startswith('https://') else None,
-                                   timeout=aiohttp.ClientTimeout(total=timeout), allow_redirects=False) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    for line in text.strip().split('\n'):
-                        if line.startswith('colo='):
-                            colo = line.split('=', 1)[1].strip()
-                            if colo and colo.upper() != 'UNKNOWN':
-                                return colo.upper()
-                    if 'CF-RAY' in resp.headers:
-                        cf_ray = resp.headers['CF-RAY']
-                        if '-' in cf_ray:
-                            for part in cf_ray.split('-')[-2:]:
-                                if len(part) == 3 and part.isalpha():
-                                    return part.upper()
+            size = int(line.split(b";", 1)[0].strip() or b"0", 16)
+        except ValueError:
+            break
+        if size <= 0:
+            break
+        out += rest[:size]
+        data = rest[size + 2:]
+    return bytes(out)
+
+
+def parse_http_response(raw: bytes) -> Tuple[int, Dict[str, str], bytes]:
+    """解析 HTTP/1.x 响应，返回 (状态码, 小写响应头, 响应体)。"""
+    head, sep, body = raw.partition(b"\r\n\r\n")
+    if not sep:
+        return 0, {}, b""
+    lines = head.split(b"\r\n")
+    try:
+        status = int(lines[0].split(b" ")[1])
+    except (IndexError, ValueError):
+        status = 0
+    headers = {}
+    for line in lines[1:]:
+        if b":" in line:
+            key, value = line.split(b":", 1)
+            headers[key.decode("latin-1").strip().lower()] = value.decode("latin-1").strip()
+    if headers.get("transfer-encoding", "").lower() == "chunked":
+        body = dechunk_body(body)
+    return status, headers, body
+
+
+async def http_get_via_ip(ip: str, path: str, host: str, use_tls: bool, timeout: float = 3.0) -> bytes:
+    """直连指定 IP 发送一个 HTTP/1.1 GET，返回原始响应字节（仅用标准库 asyncio/ssl）。"""
+    port = 443 if use_tls else 80
+    ssl_ctx = None
+    if use_tls:
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(ip, port, ssl=ssl_ctx, server_hostname=host if use_tls else None),
+        timeout=timeout,
+    )
+    try:
+        request = (
+            f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+            f"User-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        )
+        writer.write(request.encode())
+        await writer.drain()
+        return await asyncio.wait_for(reader.read(65536), timeout=timeout)
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def get_iata_code_async(ip: str, timeout: int = 3) -> Optional[str]:
+    test_host = "speed.cloudflare.com"
+    for use_tls in (False, True):
+        try:
+            raw = await http_get_via_ip(ip, "/cdn-cgi/trace", test_host, use_tls, timeout)
         except Exception:
             continue
+        status, headers, body = parse_http_response(raw)
+        if status != 200:
+            continue
+        text = body.decode("utf-8", "replace")
+        for line in text.strip().split('\n'):
+            if line.startswith('colo='):
+                colo = line.split('=', 1)[1].strip()
+                if colo and colo.upper() != 'UNKNOWN':
+                    return colo.upper()
+        cf_ray = headers.get('cf-ray')
+        if cf_ray and '-' in cf_ray:
+            for part in cf_ray.split('-')[-2:]:
+                if len(part) == 3 and part.isalpha():
+                    return part.upper()
     return None
 
 async def async_tcp_ping(ip: str, port: int, timeout: float = 1.0) -> Optional[float]:
@@ -473,7 +558,7 @@ class CloudflareScanner:
                 continue
         return ip_list
 
-    async def test_single_ip(self, session: aiohttp.ClientSession, ip: str):
+    async def test_single_ip(self, ip: str):
         if not self.running:
             return None
         latency = await measure_tcp_latency(ip, self.port, self.ping_times, self.timeout)
@@ -481,7 +566,7 @@ class CloudflareScanner:
             iata = None
             if self.running:
                 try:
-                    iata = await get_iata_code_async(session, ip, self.timeout)
+                    iata = await get_iata_code_async(ip, self.timeout)
                 except Exception as e:
                     if self.log_callback:
                         self.log_callback(f"获取地区码失败 {ip}: {str(e)}")
@@ -496,33 +581,31 @@ class CloudflareScanner:
 
     async def batch_test_ips(self, ip_list: List[str]):
         semaphore = asyncio.Semaphore(self.max_workers)
-        family = socket.AF_INET6 if self.ip_version == 6 else socket.AF_INET
-        connector = aiohttp.TCPConnector(limit=self.max_workers, force_close=True,
-                                         enable_cleanup_closed=True, limit_per_host=0, family=family)
         successful = []
         start_time = time.time()
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async def _test(ip):
-                async with semaphore:
-                    return await self.test_single_ip(session, ip)
-            tasks = [asyncio.create_task(_test(ip)) for ip in ip_list if self.running]
-            total = len(tasks)
-            completed = 0
-            last_update = 0.0
-            for fut in asyncio.as_completed(tasks):
-                if not self.running:
-                    break
-                result = await fut
-                completed += 1
-                if result:
-                    successful.append(result)
-                now = time.time()
-                if now - last_update >= 0.5 or completed == total:
-                    elapsed = now - start_time
-                    speed = completed / elapsed if elapsed > 0 else 0
-                    if self.progress_callback:
-                        self.progress_callback(completed, total, len(successful), speed)
-                    last_update = now
+
+        async def _test(ip):
+            async with semaphore:
+                return await self.test_single_ip(ip)
+
+        tasks = [asyncio.create_task(_test(ip)) for ip in ip_list if self.running]
+        total = len(tasks)
+        completed = 0
+        last_update = 0.0
+        for fut in asyncio.as_completed(tasks):
+            if not self.running:
+                break
+            result = await fut
+            completed += 1
+            if result:
+                successful.append(result)
+            now = time.time()
+            if now - last_update >= 0.5 or completed == total:
+                elapsed = now - start_time
+                speed = completed / elapsed if elapsed > 0 else 0
+                if self.progress_callback:
+                    self.progress_callback(completed, total, len(successful), speed)
+                last_update = now
         return successful
 
     async def run_scan_async(self):
@@ -827,7 +910,15 @@ class NodeShareDialog(QDialog):
 
         self.setWindowTitle("节点分享")
         self.setModal(True)
-        self.setMinimumWidth(560)
+        if IS_ANDROID:
+            screen = QApplication.primaryScreen()
+            avail = screen.availableGeometry() if screen else None
+            width = min(360, avail.width()) if avail else 360
+            height = min(620, avail.height()) if avail else 620
+            self.setMinimumWidth(min(320, width))
+            self.resize(width, height)
+        else:
+            self.setMinimumWidth(560)
         self.setStyleSheet(f"""
             QDialog {{ background: #F9FAFB; }}
             QLabel {{ color: #111827; font-family: "{SYSTEM_FONT}"; }}
@@ -847,9 +938,13 @@ class NodeShareDialog(QDialog):
         grid.addWidget(lbl, row, 0)
         grid.addWidget(widget, row, 1)
         if hint:
-            tip = QLabel(hint)
-            tip.setStyleSheet("color:#6B7280;font-size:11px;")
-            grid.addWidget(tip, row, 2)
+            if IS_ANDROID:
+                # 窄屏放不下第三列提示文字，改为长按提示
+                widget.setToolTip(hint)
+            else:
+                tip = QLabel(hint)
+                tip.setStyleSheet("color:#6B7280;font-size:11px;")
+                grid.addWidget(tip, row, 2)
         return row + 1
 
     def _make_edit(self, text: str = "", validator=None) -> QLineEdit:
@@ -914,7 +1009,11 @@ class NodeShareDialog(QDialog):
         self.input_ech = self._make_edit(DEFAULT_SHARE_ECH)
         ech_layout.addWidget(self.input_ech, 1)
         row = self._add_field(grid, row, "ECH", ech_box)
-        grid.addWidget(self.chk_ech, row - 1, 2)
+        if IS_ANDROID:
+            grid.addWidget(self.chk_ech, row, 1)
+            row += 1
+        else:
+            grid.addWidget(self.chk_ech, row - 1, 2)
         main.addLayout(grid)
 
         preview_title = QLabel("预览")
@@ -940,6 +1039,7 @@ class NodeShareDialog(QDialog):
         main.addWidget(self.preview)
 
         self.count_label = QLabel()
+        self.count_label.setWordWrap(True)
         self.count_label.setStyleSheet("color:#0F766E;font-size:12px;font-weight:bold;")
         main.addWidget(self.count_label)
 
@@ -962,7 +1062,7 @@ class NodeShareDialog(QDialog):
         self.btn_cancel.clicked.connect(self.reject)
         for btn, color in ((self.btn_copy, "#F97316"), (self.btn_save, "#8B5CF6"), (self.btn_cancel, "#6B7280")):
             btn.setFixedHeight(BTN_H)
-            btn.setMinimumWidth(108)
+            btn.setMinimumWidth(88 if IS_ANDROID else 108)
             btn.setFont(FONT_BTN)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setStyleSheet(
@@ -1068,7 +1168,8 @@ class NodeShareDialog(QDialog):
     def export_to_file(self):
         if not self._validate():
             return
-        default_name = f"cfs_nodes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        default_name = os.path.join(
+            get_default_save_dir(), f"cfs_nodes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         fname, _ = QFileDialog.getSaveFileName(
             self, "导出节点分享", default_name, "文本文件 (*.txt);;所有文件 (*)")
         if not fname:
@@ -1130,8 +1231,13 @@ class CloudflareScanUI(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CloudFlare Scan - 小琳解说 V4.1")
-        self.resize(430, 750)
-        self.setMinimumSize(420, 600)
+        if IS_ANDROID:
+            # 手机屏幕按 dp 计通常只有 360~420 宽，放宽最小尺寸并铺满屏幕
+            self.setMinimumSize(320, 480)
+            self.resize(430, 750)
+        else:
+            self.resize(430, 750)
+            self.setMinimumSize(420, 600)
         self.setStyleSheet(f"""
             QWidget {{
                 font-family: '{SYSTEM_FONT}';
@@ -1181,6 +1287,9 @@ class CloudflareScanUI(QWidget):
         title = QLabel('<span style="color:#ff7a18;">CloudFlare</span> <span style="color:#111827;">Scan</span>')
         title.setFont(FONT_TITLE)
         title.setAlignment(Qt.AlignCenter)
+        if IS_ANDROID:
+            # 28pt 的标题在手机上会把布局最小宽度撑到 555px，超出屏幕
+            title.setWordWrap(True)
         main.addWidget(title)
 
         link_layout = QHBoxLayout()
@@ -1283,9 +1392,6 @@ class CloudflareScanUI(QWidget):
         row3.addStretch()
         main.addLayout(row3)
 
-        row4 = QHBoxLayout()
-        row4.addStretch()
-
         workers_widget = QWidget()
         workers_layout = QHBoxLayout(workers_widget)
         workers_layout.setContentsMargins(0,0,0,0)
@@ -1302,8 +1408,6 @@ class CloudflareScanUI(QWidget):
         self.input_workers.setValidator(QIntValidator(1, 300))
         self.input_workers.setFixedWidth(42)
         workers_layout.addWidget(self.input_workers)
-        row4.addWidget(workers_widget)
-        row4.addSpacing(5)
 
         latency_widget = QWidget()
         latency_layout = QHBoxLayout(latency_widget)
@@ -1321,8 +1425,6 @@ class CloudflareScanUI(QWidget):
         self.input_latency.setValidator(QIntValidator(50,999))
         self.input_latency.setFixedWidth(42)
         latency_layout.addWidget(self.input_latency)
-        row4.addWidget(latency_widget)
-        row4.addSpacing(5)
 
         v4_sample_widget = QWidget()
         v4_sample_layout = QHBoxLayout(v4_sample_widget)
@@ -1340,8 +1442,6 @@ class CloudflareScanUI(QWidget):
         self.input_v4_sample.setValidator(QIntValidator(1, 5))
         self.input_v4_sample.setFixedWidth(33)
         v4_sample_layout.addWidget(self.input_v4_sample)
-        row4.addWidget(v4_sample_widget)
-        row4.addSpacing(5)
 
         v6_sample_widget = QWidget()
         v6_sample_layout = QHBoxLayout(v6_sample_widget)
@@ -1359,10 +1459,18 @@ class CloudflareScanUI(QWidget):
         self.input_v6_sample.setValidator(QIntValidator(100, 300))
         self.input_v6_sample.setFixedWidth(42)
         v6_sample_layout.addWidget(self.input_v6_sample)
-        row4.addWidget(v6_sample_widget)
 
-        row4.addStretch()
-        main.addLayout(row4)
+        # 手机竖屏一行放不下四组参数，Android 下拆成两行
+        parameter_groups = [workers_widget, latency_widget, v4_sample_widget, v6_sample_widget]
+        per_row = 2 if IS_ANDROID else 4
+        for start in range(0, len(parameter_groups), per_row):
+            param_row = QHBoxLayout()
+            param_row.addStretch()
+            for group in parameter_groups[start:start + per_row]:
+                param_row.addWidget(group)
+                param_row.addSpacing(12 if IS_ANDROID else 5)
+            param_row.addStretch()
+            main.addLayout(param_row)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setFixedHeight(10)
@@ -1383,12 +1491,12 @@ class CloudflareScanUI(QWidget):
         tab_btn_layout = QHBoxLayout()
         tab_btn_layout.addStretch()
         self.tab_btn_log = QPushButton("扫描日志")
-        self.tab_btn_log.setFixedSize(180,32)
+        self.tab_btn_log.setFixedSize(TAB_BTN_W,32)
         self.tab_btn_log.setFont(FONT_BTN)
         self.tab_btn_log.setCheckable(True)
         self.tab_btn_log.clicked.connect(lambda: self.switch_tab(0))
         self.tab_btn_speed = QPushButton("测速结果")
-        self.tab_btn_speed.setFixedSize(180,32)
+        self.tab_btn_speed.setFixedSize(TAB_BTN_W,32)
         self.tab_btn_speed.setFont(FONT_BTN)
         self.tab_btn_speed.setCheckable(True)
         self.tab_btn_speed.clicked.connect(lambda: self.switch_tab(1))
@@ -1585,7 +1693,10 @@ class CloudflareScanUI(QWidget):
         if not self.speed_results:
             self.status_display.append("错误：没有测速结果可以导出！")
             return
-        fname, _ = QFileDialog.getSaveFileName(self, "保存测速结果", f"cfs_results_{datetime.now().strftime('%Y%m%d')}.csv", "CSV文件 (*.csv)")
+        fname, _ = QFileDialog.getSaveFileName(
+            self, "保存测速结果",
+            os.path.join(get_default_save_dir(), f"cfs_results_{datetime.now().strftime('%Y%m%d')}.csv"),
+            "CSV文件 (*.csv)")
         if not fname:
             return
         if not fname.endswith('.csv'):
@@ -1774,7 +1885,8 @@ def find_icon_file():
                 return path
     return None
 
-if __name__ == "__main__":
+def run_app():
+    """创建并运行主窗口。桌面版和 Android 版（main.py）共用此入口。"""
     if platform.system() == "Darwin":
         os.environ['QT_MAC_WANTS_LAYER'] = '1'
     app = QApplication(sys.argv)
@@ -1784,5 +1896,12 @@ if __name__ == "__main__":
     win = CloudflareScanUI()
     if icon:
         win.setWindowIcon(QIcon(icon))
-    win.show()
-    sys.exit(app.exec())
+    if IS_ANDROID:
+        win.showMaximized()
+    else:
+        win.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(run_app())

@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Android 打包中间产物（由 android/build_apk.sh 生成）
+.android-wheels/
+.android-work/
+pysidedeploy.spec
+buildozer/
+.buildozer/
+*.apk
+*.aab
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -279,5 +279,69 @@ class TestGuiIntegration(unittest.TestCase):
         dlg.deleteLater()
 
 
+class TestAndroidPackaging(unittest.TestCase):
+    """Android 打包相关的约束与适配。"""
+
+    def test_source_has_no_aiohttp(self):
+        # aiohttp 及其 8 个 C 扩展依赖在 python-for-android 下很难编，已改为纯标准库实现
+        source = (HERE / "CloudFlareScan.py").read_text(encoding="utf-8")
+        self.assertNotIn("aiohttp", source)
+
+    def test_is_android_false_on_desktop(self):
+        self.assertFalse(cfs.is_android())
+
+    def test_save_dir_is_usable(self):
+        path = cfs.get_default_save_dir()
+        self.assertTrue(path)
+        self.assertTrue(os.path.isdir(path))
+
+    def test_patch_spec_script_exists(self):
+        self.assertTrue((HERE / "android" / "patch_spec.py").exists())
+        self.assertTrue((HERE / "android" / "build_apk.sh").exists())
+        self.assertTrue((HERE / "main.py").exists())
+        self.assertTrue((HERE / ".github" / "workflows" / "android.yml").exists())
+
+
+class TestHttpParsing(unittest.TestCase):
+    """aiohttp 替换成标准库后，HTTP 响应解析必须仍然正确。"""
+
+    def test_dechunk_two_chunks(self):
+        raw = b"9\r\ncolo=HKG\n\r\nb\r\nip=1.2.3.4\n\r\n0\r\n\r\n"
+        self.assertEqual(cfs.dechunk_body(raw), b"colo=HKG\nip=1.2.3.4\n")
+
+    def test_dechunk_single_chunk(self):
+        raw = b"14\r\ncolo=HKG\nip=1.2.3.4\n\r\n0\r\n\r\n"
+        self.assertEqual(cfs.dechunk_body(raw), b"colo=HKG\nip=1.2.3.4\n")
+
+    def test_parse_plain_response(self):
+        raw = b"HTTP/1.1 200 OK\r\nCf-Ray: abc123-SJC\r\nContent-Type: text/plain\r\n\r\ncolo=SJC\nip=1.2.3.4\n"
+        status, headers, body = cfs.parse_http_response(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["cf-ray"], "abc123-SJC")
+        self.assertEqual(body, b"colo=SJC\nip=1.2.3.4\n")
+
+    def test_parse_chunked_response(self):
+        raw = (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nCF-RAY: 8a1b-HKG\r\n\r\n"
+               b"14\r\ncolo=HKG\nip=1.2.3.4\n\r\n0\r\n\r\n")
+        status, headers, body = cfs.parse_http_response(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["cf-ray"], "8a1b-HKG")
+        self.assertEqual(body, b"colo=HKG\nip=1.2.3.4\n")
+
+    def test_parse_headers_are_lowercased(self):
+        _, headers, _ = cfs.parse_http_response(b"HTTP/1.1 200 OK\r\nX-Weird-Header: V\r\n\r\n")
+        self.assertEqual(headers["x-weird-header"], "V")
+
+    def test_parse_garbage_is_safe(self):
+        self.assertEqual(cfs.parse_http_response(b""), (0, {}, b""))
+        self.assertEqual(cfs.parse_http_response(b"not http at all"), (0, {}, b""))
+        status, _, _ = cfs.parse_http_response(b"BROKEN\r\n\r\nbody")
+        self.assertEqual(status, 0)
+
+    def test_non_200_status(self):
+        status, _, _ = cfs.parse_http_response(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+        self.assertEqual(status, 403)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

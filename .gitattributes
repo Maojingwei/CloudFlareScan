@@ -1,0 +1,16 @@
+# 统一换行符：shell 脚本若被检出成 CRLF，在 Linux/macOS 上会报
+# "bash: .../\r: No such file or directory" 而无法执行。
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.spec text eol=lf
+*.md   text eol=lf
+
+*.png binary
+*.ico binary
+*.icns binary
+*.apk binary
+*.aab binary
