@@ -85,8 +85,13 @@ fi
 log "下载 Qt for Python Android wheel (架构 $ANDROID_ARCH)"
 mkdir -p "$WHEEL_DIR"
 
-PYSIDE_WHEEL="$WHEEL_DIR/PySide6-android.whl"
-SHIBOKEN_WHEEL="$WHEEL_DIR/shiboken6-android.whl"
+# 千万不要把 wheel 改成 PySide6-android.whl 这类短名！
+# pyside6-android-deploy 的 get_wheel_android_arch() 是直接从「文件名」里
+# 找 aarch64/armv7a/i686/x86_64 的（wheel.stem），改名会导致架构解析为 None 而失败。
+PYSIDE_WHEEL_NAME="PySide6-${QTPY_VERSION}-${QTPY_VERSION}-cp311-cp311-android_${ANDROID_ARCH}.whl"
+SHIBOKEN_WHEEL_NAME="shiboken6-${QTPY_VERSION}-${QTPY_VERSION}-cp311-cp311-android_${ANDROID_ARCH}.whl"
+PYSIDE_WHEEL="$WHEEL_DIR/$PYSIDE_WHEEL_NAME"
+SHIBOKEN_WHEEL="$WHEEL_DIR/$SHIBOKEN_WHEEL_NAME"
 
 download_first() { # <输出文件> <候选 URL...>
   local out="$1"; shift
@@ -103,14 +108,14 @@ download_first() { # <输出文件> <候选 URL...>
   return 1
 }
 
-# 6.10.x 的 wheel 文件名是大写 PySide6-，6.11+ 变成小写 pyside6-
+# 6.10.x 的 wheel 文件名是大写 PySide6-，6.11+ 变成小写 pyside6-，两种都试
 download_first "$PYSIDE_WHEEL" \
-  "$QT_BASE/pyside6/PySide6-$QTPY_VERSION-$QTPY_VERSION-cp311-cp311-android_$ANDROID_ARCH.whl" \
-  "$QT_BASE/pyside6/pyside6-$QTPY_VERSION-$QTPY_VERSION-cp311-cp311-android_$ANDROID_ARCH.whl" \
+  "$QT_BASE/pyside6/$PYSIDE_WHEEL_NAME" \
+  "$QT_BASE/pyside6/pyside6-${QTPY_VERSION}-${QTPY_VERSION}-cp311-cp311-android_${ANDROID_ARCH}.whl" \
   || die "无法下载 PySide6 Android wheel ($QTPY_VERSION / $ANDROID_ARCH)"
 
 download_first "$SHIBOKEN_WHEEL" \
-  "$QT_BASE/shiboken6/shiboken6-$QTPY_VERSION-$QTPY_VERSION-cp311-cp311-android_$ANDROID_ARCH.whl" \
+  "$QT_BASE/shiboken6/$SHIBOKEN_WHEEL_NAME" \
   || die "无法下载 shiboken6 Android wheel ($QTPY_VERSION / $ANDROID_ARCH)"
 
 # ---------------------------------------------------------------- SDK / NDK
