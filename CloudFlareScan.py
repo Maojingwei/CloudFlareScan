@@ -7,17 +7,20 @@ import aiohttp
 import socket
 import ssl
 from datetime import datetime
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 import csv
+import base64
+from urllib.parse import quote
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton,
     QLineEdit, QProgressBar, QVBoxLayout, QHBoxLayout,
     QTextEdit, QComboBox, QFileDialog, QMessageBox,
-    QScrollArea, QFrame, QStackedWidget, QDialog, QDialogButtonBox
+    QScrollArea, QFrame, QStackedWidget, QDialog, QDialogButtonBox,
+    QCheckBox, QGridLayout
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont, QIcon, QIntValidator
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings
+from PySide6.QtGui import QFont, QIcon, QIntValidator, QDoubleValidator
 import os
 import platform
 
@@ -195,6 +198,23 @@ PORT_OPTIONS = ["443", "2053", "2083", "2087", "2096", "8443"]
 IPV4_IPS_PER_SUBNET = 1
 IPV6_IPS_PER_CIDR = 100
 
+# ---------------- 节点分享（VLESS 分享链接）默认参数 ----------------
+DEFAULT_SHARE_SPEED_THRESHOLD = 2.0
+DEFAULT_SHARE_UUID = "73bcd72f-9545-4cb8-8daf-7d004501880d"
+DEFAULT_SHARE_HOST = "mjw04.ccwu.cc"
+DEFAULT_SHARE_SNI = "mjw04.ccwu.cc"
+DEFAULT_SHARE_PATH = "/"
+DEFAULT_SHARE_ECH = "cloudflare-ech.com+https://dns.alidns.com/dns-query"
+DEFAULT_SHARE_FINGERPRINT = "chrome"
+DEFAULT_SHARE_REMARK_PREFIX = "CF移动优选"
+DEFAULT_SHARE_START_INDEX = 1
+
+# 生成分享链接时查询参数的固定顺序（与目标格式保持一致）
+SHARE_QUERY_ORDER = [
+    "path", "security", "encryption", "insecure", "host",
+    "fp", "ech", "type", "allowInsecure", "sni",
+]
+
 
 def get_iata_translation(iata_code: str) -> str:
     return AIRPORT_CODES.get(iata_code, iata_code if iata_code else "未知地区")
@@ -301,6 +321,113 @@ async def measure_tcp_latency(ip: str, port: int, ping_times: int = 2, timeout: 
         if i < ping_times - 1:
             await asyncio.sleep(0.05)
     return min(latencies) if latencies else None
+
+
+# ==================== 节点分享：纯函数部分 ====================
+
+def format_host_port(ip: str, port) -> str:
+    """IPv6 地址在 URL 中必须用方括号包裹，否则会被解析成 host:port 的分隔符。"""
+    ip = str(ip).strip()
+    if ":" in ip and not ip.startswith("["):
+        return f"[{ip}]:{port}"
+    return f"{ip}:{port}"
+
+
+def build_vless_link(ip: str, port, uuid: str = DEFAULT_SHARE_UUID,
+                     host: str = DEFAULT_SHARE_HOST, sni: str = DEFAULT_SHARE_SNI,
+                     path: str = DEFAULT_SHARE_PATH, ech: str = DEFAULT_SHARE_ECH,
+                     remark: str = "", fingerprint: str = DEFAULT_SHARE_FINGERPRINT,
+                     security: str = "tls") -> str:
+    """按固定参数顺序拼装 vless:// 分享链接，参数值统一做百分号编码。"""
+    params = {
+        "path": path,
+        "security": security,
+        "encryption": "none",
+        "insecure": "0",
+        "host": host,
+        "fp": fingerprint,
+        "ech": ech,
+        "type": "ws",
+        "allowInsecure": "0",
+        "sni": sni,
+    }
+    query = "&".join(
+        f"{key}={quote(str(params[key]), safe='')}"
+        for key in SHARE_QUERY_ORDER
+        if params.get(key) not in (None, "")
+    )
+    link = f"vless://{uuid}@{format_host_port(ip, port)}?{query}"
+    if remark:
+        link += "#" + quote(str(remark), safe="")
+    return link
+
+
+def filter_nodes_by_speed(speed_results: List[Dict], threshold: float = DEFAULT_SHARE_SPEED_THRESHOLD) -> List[Dict]:
+    """筛选下载速度严格大于阈值的测速结果，按速度从高到低排序。"""
+    matched = []
+    for item in speed_results or []:
+        try:
+            speed = float(item.get("download_speed") or 0)
+        except (TypeError, ValueError):
+            speed = 0.0
+        if speed > float(threshold):
+            matched.append(item)
+    matched.sort(key=lambda x: float(x.get("download_speed") or 0), reverse=True)
+    return matched
+
+
+def parse_share_ports(text: str) -> List[int]:
+    """解析逗号/空格分隔的端口列表，非法或越界的端口会被丢弃。"""
+    ports = []
+    for chunk in str(text or "").replace(",", " ").replace("，", " ").split():
+        try:
+            port = int(chunk)
+        except ValueError:
+            continue
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+    return ports
+
+
+def build_share_nodes(speed_results: List[Dict], threshold: float = DEFAULT_SHARE_SPEED_THRESHOLD,
+                      ports: Optional[List[int]] = None, uuid: str = DEFAULT_SHARE_UUID,
+                      host: str = DEFAULT_SHARE_HOST, sni: str = DEFAULT_SHARE_SNI,
+                      path: str = DEFAULT_SHARE_PATH, ech: str = DEFAULT_SHARE_ECH,
+                      remark_prefix: str = DEFAULT_SHARE_REMARK_PREFIX,
+                      start_index: int = DEFAULT_SHARE_START_INDEX,
+                      fingerprint: str = DEFAULT_SHARE_FINGERPRINT) -> List[Tuple[str, str]]:
+    """返回 [(备注, 链接), ...]；ports 为空时使用每条测速结果自身的端口。"""
+    matched = filter_nodes_by_speed(speed_results, threshold)
+    nodes: List[Tuple[str, str]] = []
+    index = max(1, int(start_index))
+    for item in matched:
+        ip = str(item.get("ip", "")).strip()
+        if not ip:
+            continue
+        if ports:
+            item_ports = list(ports)
+        else:
+            try:
+                item_ports = [int(item.get("port") or 443)]
+            except (TypeError, ValueError):
+                item_ports = [443]
+        for port in item_ports:
+            remark = f"{remark_prefix}{index}" if remark_prefix else str(index)
+            nodes.append((remark, build_vless_link(
+                ip=ip, port=port, uuid=uuid, host=host, sni=sni,
+                path=path, ech=ech, remark=remark, fingerprint=fingerprint,
+            )))
+            index += 1
+    return nodes
+
+
+def nodes_to_text(nodes: List[Tuple[str, str]]) -> str:
+    return "\n".join(link for _, link in nodes)
+
+
+def nodes_to_subscription(nodes: List[Tuple[str, str]]) -> str:
+    """Base64 订阅内容（部分客户端要求）。"""
+    return base64.b64encode(nodes_to_text(nodes).encode("utf-8")).decode("ascii")
 
 
 class CloudflareScanner:
@@ -686,6 +813,319 @@ class CustomDialog(QDialog):
         return dialog.exec() == QDialog.Accepted
 
 
+class NodeShareDialog(QDialog):
+    """节点分享：按速度阈值筛选测速结果，生成 vless:// 分享链接。"""
+
+    def __init__(self, speed_results: List[Dict], default_port: int = 443,
+                 parent=None, log_callback=None):
+        super().__init__(parent)
+        self.speed_results = speed_results or []
+        self.default_port = default_port
+        self.log_callback = log_callback
+        self.nodes: List[Tuple[str, str]] = []
+        self.settings = QSettings("CloudFlareScan", "NodeShare")
+
+        self.setWindowTitle("节点分享")
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        self.setStyleSheet(f"""
+            QDialog {{ background: #F9FAFB; }}
+            QLabel {{ color: #111827; font-family: "{SYSTEM_FONT}"; }}
+            QCheckBox {{ color: #111827; font-family: "{SYSTEM_FONT}"; }}
+        """)
+
+        self._build_ui()
+        self._load_settings()
+        self._refresh()
+
+    # ---------------- UI ----------------
+
+    def _add_field(self, grid: QGridLayout, row: int, label: str, widget, hint: str = ""):
+        lbl = QLabel(label)
+        lbl.setFont(FONT_BTN)
+        lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        grid.addWidget(lbl, row, 0)
+        grid.addWidget(widget, row, 1)
+        if hint:
+            tip = QLabel(hint)
+            tip.setStyleSheet("color:#6B7280;font-size:11px;")
+            grid.addWidget(tip, row, 2)
+        return row + 1
+
+    def _make_edit(self, text: str = "", validator=None) -> QLineEdit:
+        edit = QLineEdit()
+        edit.setFixedHeight(BTN_H)
+        edit.setFont(FONT_BTN)
+        edit.setStyleSheet(LINE_EDIT_STYLE)
+        if text:
+            edit.setText(text)
+        if validator is not None:
+            edit.setValidator(validator)
+        edit.textChanged.connect(self._refresh)
+        return edit
+
+    def _build_ui(self):
+        main = QVBoxLayout(self)
+        main.setContentsMargins(16, 16, 16, 14)
+        main.setSpacing(10)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(1, 1)
+
+        row = 0
+        self.input_threshold = self._make_edit(
+            str(DEFAULT_SHARE_SPEED_THRESHOLD), QDoubleValidator(0.0, 100000.0, 2, self))
+        row = self._add_field(grid, row, "速度阈值", self.input_threshold, "MB/s，只分享大于该速度的 IP")
+
+        self.input_uuid = self._make_edit(DEFAULT_SHARE_UUID)
+        row = self._add_field(grid, row, "UUID", self.input_uuid)
+
+        self.input_host = self._make_edit(DEFAULT_SHARE_HOST)
+        row = self._add_field(grid, row, "伪装域名 Host", self.input_host)
+
+        self.input_sni = self._make_edit(DEFAULT_SHARE_SNI)
+        self.input_sni.setPlaceholderText("留空则与 Host 相同")
+        row = self._add_field(grid, row, "SNI", self.input_sni)
+
+        self.input_path = self._make_edit(DEFAULT_SHARE_PATH)
+        row = self._add_field(grid, row, "WS 路径", self.input_path)
+
+        self.input_prefix = self._make_edit(DEFAULT_SHARE_REMARK_PREFIX)
+        row = self._add_field(grid, row, "备注前缀", self.input_prefix, "生成 “前缀+序号” 形式的备注")
+
+        self.input_start_index = self._make_edit(
+            str(DEFAULT_SHARE_START_INDEX), QIntValidator(1, 999999, self))
+        row = self._add_field(grid, row, "起始序号", self.input_start_index)
+
+        self.input_ports = self._make_edit("")
+        self.input_ports.setPlaceholderText("留空 = 使用测速端口；可填 443,2083")
+        row = self._add_field(grid, row, "端口", self.input_ports, "多个端口用逗号分隔")
+
+        self.chk_ech = QCheckBox("启用 ECH")
+        self.chk_ech.setChecked(True)
+        self.chk_ech.setFont(FONT_BTN)
+        self.chk_ech.toggled.connect(self._on_ech_toggled)
+        ech_box = QWidget()
+        ech_layout = QHBoxLayout(ech_box)
+        ech_layout.setContentsMargins(0, 0, 0, 0)
+        ech_layout.setSpacing(6)
+        self.input_ech = self._make_edit(DEFAULT_SHARE_ECH)
+        ech_layout.addWidget(self.input_ech, 1)
+        row = self._add_field(grid, row, "ECH", ech_box)
+        grid.addWidget(self.chk_ech, row - 1, 2)
+        main.addLayout(grid)
+
+        preview_title = QLabel("预览")
+        preview_title.setFont(FONT_BTN)
+        main.addWidget(preview_title)
+
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setFixedHeight(120)
+        self.preview.setFont(FONT_STATUS)
+        self.preview.setStyleSheet(f"""
+            QTextEdit {{
+                background: #0B3C5D;
+                border: 1px solid #0F4C75;
+                border-radius: 6px;
+                padding: 6px;
+                color: #ECF1F1;
+                font-family: 'Consolas', '{SYSTEM_FONT}';
+                font-size: 11px;
+            }}
+            {SCROLLBAR_STYLE}
+        """)
+        main.addWidget(self.preview)
+
+        self.count_label = QLabel()
+        self.count_label.setStyleSheet("color:#0F766E;font-size:12px;font-weight:bold;")
+        main.addWidget(self.count_label)
+
+        self.chk_base64 = QCheckBox("复制/导出为 Base64 订阅格式")
+        self.chk_base64.setFont(FONT_BTN)
+        main.addWidget(self.chk_base64)
+
+        self.feedback = QLabel("")
+        self.feedback.setWordWrap(True)
+        self.feedback.setStyleSheet("color:#6B7280;font-size:12px;")
+        main.addWidget(self.feedback)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        self.btn_copy = QPushButton("复制到剪贴板")
+        self.btn_copy.clicked.connect(self.copy_to_clipboard)
+        self.btn_save = QPushButton("导出文件")
+        self.btn_save.clicked.connect(self.export_to_file)
+        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.clicked.connect(self.reject)
+        for btn, color in ((self.btn_copy, "#F97316"), (self.btn_save, "#8B5CF6"), (self.btn_cancel, "#6B7280")):
+            btn.setFixedHeight(BTN_H)
+            btn.setMinimumWidth(108)
+            btn.setFont(FONT_BTN)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(
+                f"QPushButton{{background:{color};color:white;border:none;border-radius:6px;"
+                f"font-family:'{SYSTEM_FONT}';}}QPushButton:hover{{background:{color};opacity:0.9;}}"
+                f"QPushButton:disabled{{background:#E5E7EB;color:#6B7280;}}")
+            btns.addWidget(btn)
+        main.addLayout(btns)
+
+    def _on_ech_toggled(self, checked: bool):
+        self.input_ech.setEnabled(checked)
+        self._refresh()
+
+    # ---------------- 参数与预览 ----------------
+
+    def _config(self) -> Dict:
+        def as_float(text, fallback):
+            try:
+                return float(str(text).strip())
+            except (TypeError, ValueError):
+                return fallback
+
+        def as_int(text, fallback):
+            try:
+                return int(str(text).strip())
+            except (TypeError, ValueError):
+                return fallback
+
+        host = self.input_host.text().strip()
+        sni = self.input_sni.text().strip() or host
+        return {
+            "threshold": as_float(self.input_threshold.text(), DEFAULT_SHARE_SPEED_THRESHOLD),
+            "ports": parse_share_ports(self.input_ports.text()),
+            "uuid": self.input_uuid.text().strip(),
+            "host": host,
+            "sni": sni,
+            "path": self.input_path.text().strip() or "/",
+            "ech": self.input_ech.text().strip() if self.chk_ech.isChecked() else "",
+            "remark_prefix": self.input_prefix.text().strip(),
+            "start_index": max(1, as_int(self.input_start_index.text(), DEFAULT_SHARE_START_INDEX)),
+            "fingerprint": DEFAULT_SHARE_FINGERPRINT,
+        }
+
+    def _regenerate(self):
+        cfg = self._config()
+        self.nodes = build_share_nodes(
+            self.speed_results,
+            threshold=cfg["threshold"], ports=cfg["ports"], uuid=cfg["uuid"],
+            host=cfg["host"], sni=cfg["sni"], path=cfg["path"], ech=cfg["ech"],
+            remark_prefix=cfg["remark_prefix"], start_index=cfg["start_index"],
+            fingerprint=cfg["fingerprint"],
+        )
+        return cfg
+
+    def _refresh(self):
+        cfg = self._regenerate()
+        matched = filter_nodes_by_speed(self.speed_results, cfg["threshold"])
+        self.count_label.setText(
+            f"速度 > {cfg['threshold']:g} MB/s 的 IP：{len(matched)} 个    "
+            f"生成分享节点：{len(self.nodes)} 个"
+        )
+        if self.nodes:
+            head = nodes_to_text(self.nodes[:3])
+            more = len(self.nodes) - 3
+            self.preview.setPlainText(head + (f"\n... 其余 {more} 个节点已省略" if more > 0 else ""))
+        else:
+            self.preview.setPlainText("没有符合条件的 IP，请先测速或降低速度阈值。")
+        enabled = bool(self.nodes)
+        self.btn_copy.setEnabled(enabled)
+        self.btn_save.setEnabled(enabled)
+
+    def _validate(self) -> bool:
+        cfg = self._config()
+        if not self.speed_results:
+            self.feedback.setText("没有测速结果，请先执行完全测速或地区测速。")
+            return False
+        if not cfg["uuid"]:
+            self.feedback.setText("UUID 不能为空。")
+            return False
+        if not cfg["host"]:
+            self.feedback.setText("伪装域名 Host 不能为空。")
+            return False
+        if not self.nodes:
+            self.feedback.setText(f"没有速度大于 {cfg['threshold']:g} MB/s 的 IP，无法生成分享节点。")
+            return False
+        return True
+
+    def _payload(self) -> str:
+        if self.chk_base64.isChecked():
+            return nodes_to_subscription(self.nodes)
+        return nodes_to_text(self.nodes)
+
+    # ---------------- 动作 ----------------
+
+    def copy_to_clipboard(self):
+        if not self._validate():
+            return
+        QApplication.clipboard().setText(self._payload())
+        fmt = "Base64 订阅" if self.chk_base64.isChecked() else "明文链接"
+        self.feedback.setText(f"已复制 {len(self.nodes)} 个节点（{fmt}）到剪贴板。")
+        self._log(f"节点分享：已复制 {len(self.nodes)} 个节点到剪贴板（{fmt}）")
+
+    def export_to_file(self):
+        if not self._validate():
+            return
+        default_name = f"cfs_nodes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        fname, _ = QFileDialog.getSaveFileName(
+            self, "导出节点分享", default_name, "文本文件 (*.txt);;所有文件 (*)")
+        if not fname:
+            return
+        if not os.path.splitext(fname)[1]:
+            fname += ".txt"
+        try:
+            with open(fname, "w", encoding="utf-8") as f:
+                f.write(self._payload() + "\n")
+        except Exception as exc:  # noqa: BLE001
+            self.feedback.setText(f"导出失败: {exc}")
+            self._log(f"节点分享导出失败: {exc}")
+            return
+        self.feedback.setText(f"已导出 {len(self.nodes)} 个节点到 {fname}")
+        self._log(f"节点分享：已导出 {len(self.nodes)} 个节点到 {fname}")
+        self._save_settings()
+
+    def accept(self):
+        self._save_settings()
+        super().accept()
+
+    def _log(self, message: str):
+        if self.log_callback:
+            self.log_callback(message)
+
+    # ---------------- 记忆上次参数 ----------------
+
+    def _load_settings(self):
+        s = self.settings
+        self.input_threshold.setText(str(s.value("threshold", DEFAULT_SHARE_SPEED_THRESHOLD)))
+        self.input_uuid.setText(str(s.value("uuid", DEFAULT_SHARE_UUID)))
+        self.input_host.setText(str(s.value("host", DEFAULT_SHARE_HOST)))
+        self.input_sni.setText(str(s.value("sni", DEFAULT_SHARE_SNI)))
+        self.input_path.setText(str(s.value("path", DEFAULT_SHARE_PATH)))
+        self.input_prefix.setText(str(s.value("remark_prefix", DEFAULT_SHARE_REMARK_PREFIX)))
+        self.input_start_index.setText(str(s.value("start_index", DEFAULT_SHARE_START_INDEX)))
+        self.input_ports.setText(str(s.value("ports", "")))
+        self.input_ech.setText(str(s.value("ech", DEFAULT_SHARE_ECH)))
+        self.chk_ech.setChecked(str(s.value("ech_enabled", "true")).lower() in ("true", "1"))
+        self.chk_base64.setChecked(str(s.value("base64", "false")).lower() in ("true", "1"))
+        self.input_ech.setEnabled(self.chk_ech.isChecked())
+
+    def _save_settings(self):
+        s = self.settings
+        s.setValue("threshold", self.input_threshold.text().strip())
+        s.setValue("uuid", self.input_uuid.text().strip())
+        s.setValue("host", self.input_host.text().strip())
+        s.setValue("sni", self.input_sni.text().strip())
+        s.setValue("path", self.input_path.text().strip())
+        s.setValue("remark_prefix", self.input_prefix.text().strip())
+        s.setValue("start_index", self.input_start_index.text().strip())
+        s.setValue("ports", self.input_ports.text().strip())
+        s.setValue("ech", self.input_ech.text().strip())
+        s.setValue("ech_enabled", self.chk_ech.isChecked())
+        s.setValue("base64", self.chk_base64.isChecked())
+
+
 class CloudflareScanUI(QWidget):
     def __init__(self):
         super().__init__()
@@ -779,12 +1219,21 @@ class CloudflareScanUI(QWidget):
         self.btn_full = self.make_btn("完全测速", "#F97316", enabled=False)
         self.btn_full.clicked.connect(self.start_full_speed)
         row2.addWidget(self.btn_full)
-        row2.addSpacing(SPACING)
-        self.btn_export = self.make_btn("导出结果", "#8B5CF6", enabled=False)
-        self.btn_export.clicked.connect(self.export_results)
-        row2.addWidget(self.btn_export)
         row2.addStretch()
         main.addLayout(row2)
+
+        row2b = QHBoxLayout()
+        row2b.addStretch()
+        self.btn_export = self.make_btn("导出结果", "#8B5CF6", enabled=False)
+        self.btn_export.clicked.connect(self.export_results)
+        row2b.addWidget(self.btn_export)
+        row2b.addSpacing(SPACING)
+        self.btn_share = self.make_btn("节点分享", "#0EA5E9", enabled=False)
+        self.btn_share.setToolTip("筛选速度超过阈值的 IP，生成 vless:// 分享链接")
+        self.btn_share.clicked.connect(self.share_nodes)
+        row2b.addWidget(self.btn_share)
+        row2b.addStretch()
+        main.addLayout(row2b)
 
         row3 = QHBoxLayout()
         row3.addStretch()
@@ -1157,6 +1606,19 @@ class CloudflareScanUI(QWidget):
         except Exception as e:
             self.status_display.append(f"导出失败: {str(e)}")
 
+    def share_nodes(self):
+        if not self.speed_results:
+            self.status_display.append("错误：没有测速结果，请先执行完全测速或地区测速！")
+            CustomDialog.warning(self, "请先完成测速，再使用节点分享功能。")
+            return
+        dialog = NodeShareDialog(
+            self.speed_results,
+            default_port=self.current_scan_port,
+            parent=self,
+            log_callback=self.update_status,
+        )
+        dialog.exec()
+
     def stop_all(self):
         if self.ipv4_scan_worker and self.scanning:
             self.ipv4_scan_worker.stop()
@@ -1179,6 +1641,7 @@ class CloudflareScanUI(QWidget):
         self.display_speed_results(results)
         if results:
             self.btn_export.setEnabled(True)
+            self.btn_share.setEnabled(True)
 
     def worker_finished(self, typ):
         if typ == "scan":
@@ -1200,6 +1663,7 @@ class CloudflareScanUI(QWidget):
         self.btn_full.setEnabled(not busy and bool(self.scan_results))
         self.btn_area.setEnabled(not busy and bool(self.scan_results))
         self.btn_export.setEnabled(not busy and bool(self.speed_results))
+        self.btn_share.setEnabled(not busy and bool(self.speed_results))
         self.input_region.setEnabled(not busy)
         self.input_speed_count.setEnabled(not busy)
         self.input_workers.setEnabled(not busy)
