@@ -47,22 +47,29 @@ jobs:
 
       - name: Install host dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install "PySide6==${QTPY_VERSION}" Cython buildozer
+          # pyside6-android-deploy 启动时会校验它自带的 requirements-android.txt
+          REQ_ANDROID="$(python -c "import PySide6.scripts, os; print(os.path.join(os.path.dirname(PySide6.scripts.__file__), 'requirements-android.txt'))")"
+          echo "requirements-android.txt -> $REQ_ANDROID"
+          [ -f "$REQ_ANDROID" ] && python -m pip install -r "$REQ_ANDROID" || true
+          pyside6-android-deploy --help >/dev/null && echo "pyside6-android-deploy OK"
 
       # Android SDK/NDK 体积很大（数 GB），缓存后后续构建会快很多
+      # 注意：官方缓存目录是 ~/.pyside6_android_deploy（下划线）
       - name: Cache Android SDK and NDK
         uses: actions/cache@v4
         with:
-          path: ~/.pyside6-android-deploy
-          key: pyside6-android-sdk-ndk-${{ env.QTPY_VERSION }}-v2
+          path: ~/.pyside6_android_deploy
+          key: pyside6-android-sdk-ndk-${{ env.QTPY_VERSION }}-v3
 
       - name: Download Android SDK and NDK
         run: |
           set -euo pipefail
-          if [ -d "$HOME/.pyside6-android-deploy" ] && \
-             find "$HOME/.pyside6-android-deploy" -maxdepth 4 -type d -name platform-tools | head -n1 | grep -q .; then
-            echo "已从缓存恢复 SDK/NDK"
+          CACHE="$HOME/.pyside6_android_deploy"
+          if [ -d "$CACHE" ] && find "$CACHE" -maxdepth 5 -type d -name platform-tools | head -n1 | grep -q .; then
+            echo "已从缓存恢复 SDK/NDK，跳过下载"
             exit 0
           fi
           git clone --depth 1 --branch "${PYSIDE_SETUP_BRANCH}" \
@@ -71,6 +78,7 @@ jobs:
           [ -f "$REQ" ] && python -m pip install -r "$REQ" || true
           python "$RUNNER_TEMP/pyside-setup/tools/cross_compile_android/main.py" \
             --download-only --skip-update --auto-accept-license
+          find "$CACHE" -maxdepth 2 -type d | head -n 20
 
       - name: Cache Qt for Python Android wheels
         uses: actions/cache@v4

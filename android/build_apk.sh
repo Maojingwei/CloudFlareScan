@@ -24,7 +24,10 @@ BUILDOZER_MODE="${BUILDOZER_MODE:-debug}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-CACHE_DIR="${PYSIDE_ANDROID_CACHE:-$HOME/.pyside6-android-deploy}"
+# 官方缓存目录名是 .pyside6_android_deploy（下划线）；Qt 文档里写的连字符版本是错的
+DEFAULT_CACHE="$HOME/.pyside6_android_deploy"
+[[ -d "$HOME/.pyside6-android-deploy" ]] && DEFAULT_CACHE="$HOME/.pyside6-android-deploy"
+CACHE_DIR="${PYSIDE_ANDROID_CACHE:-$DEFAULT_CACHE}"
 WHEEL_DIR="${WHEEL_DIR:-$PROJECT_DIR/.android-wheels}"
 WORK_DIR="${WORK_DIR:-$PROJECT_DIR/.android-work}"
 QT_BASE="https://download.qt.io/official_releases/QtForPython"
@@ -46,6 +49,16 @@ echo "python3: $(python3 --version 2>&1)"
 echo "java   : $(java -version 2>&1 | head -n 1)"
 command -v pyside6-android-deploy >/dev/null \
   || die "未找到 pyside6-android-deploy，请先执行: python3 -m pip install PySide6==$QTPY_VERSION"
+
+# pyside6-android-deploy 会检查它自带的 requirements-android.txt，缺包会直接退出
+log "安装 pyside6-android-deploy 运行依赖"
+ANDROID_REQ="$(python3 -c "import PySide6.scripts, os; print(os.path.join(os.path.dirname(PySide6.scripts.__file__), 'requirements-android.txt'))" 2>/dev/null || true)"
+if [[ -n "$ANDROID_REQ" && -f "$ANDROID_REQ" ]]; then
+  python3 -m pip install -r "$ANDROID_REQ"
+else
+  echo "未找到 requirements-android.txt，改为安装已知依赖"
+  python3 -m pip install jinja2 pkginfo tqdm "packaging==24.1"
+fi
 
 # ---------------------------------------------------------------- 下载 wheel
 log "下载 Qt for Python Android wheel (架构 $ANDROID_ARCH)"
