@@ -26,7 +26,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # 官方缓存目录名是 .pyside6_android_deploy（下划线）；Qt 文档里写的连字符版本是错的
 DEFAULT_CACHE="$HOME/.pyside6_android_deploy"
-[[ -d "$HOME/.pyside6-android-deploy" ]] && DEFAULT_CACHE="$HOME/.pyside6-android-deploy"
+if [[ -d "$HOME/.pyside6-android-deploy" ]]; then
+  DEFAULT_CACHE="$HOME/.pyside6-android-deploy"
+fi
 CACHE_DIR="${PYSIDE_ANDROID_CACHE:-$DEFAULT_CACHE}"
 WHEEL_DIR="${WHEEL_DIR:-$PROJECT_DIR/.android-wheels}"
 WORK_DIR="${WORK_DIR:-$PROJECT_DIR/.android-work}"
@@ -122,8 +124,16 @@ if [[ -z "$NDK_PATH" ]]; then
   NDK_PATH="$(find "$CACHE_DIR" -maxdepth 5 -type d -name toolchains 2>/dev/null | head -n 1 || true)"
   NDK_PATH="${NDK_PATH%/toolchains}"
 fi
-[[ -n "$SDK_PATH" ]] && echo "SDK: $SDK_PATH" || echo "SDK: 交给 pyside6-android-deploy 自动侦测"
-[[ -n "$NDK_PATH" ]] && echo "NDK: $NDK_PATH" || echo "NDK: 交给 pyside6-android-deploy 自动侦测"
+if [[ -n "$SDK_PATH" ]]; then
+  echo "SDK: $SDK_PATH"
+else
+  echo "SDK: 交给 pyside6-android-deploy 自动侦测"
+fi
+if [[ -n "$NDK_PATH" ]]; then
+  echo "NDK: $NDK_PATH"
+else
+  echo "NDK: 交给 pyside6-android-deploy 自动侦测"
+fi
 
 # ---------------------------------------------------------------- 生成配置
 log "生成 pysidedeploy.spec"
@@ -151,7 +161,9 @@ pyside6-android-deploy \
 log "构建产物"
 ARTIFACTS=()
 while IFS= read -r artifact; do
-  [[ -n "$artifact" ]] && ARTIFACTS+=("$artifact")
+  if [[ -n "$artifact" ]]; then
+    ARTIFACTS+=("$artifact")
+  fi
 done < <(find "$PROJECT_DIR" -maxdepth 3 \( -name '*.apk' -o -name '*.aab' \) -type f 2>/dev/null | sort)
 
 if [[ ${#ARTIFACTS[@]} -eq 0 ]]; then
