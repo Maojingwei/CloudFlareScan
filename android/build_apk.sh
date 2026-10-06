@@ -40,7 +40,9 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 # 任何命令失败时，把「行号 + 失败命令」以 GitHub 注解形式输出。
 # 这样即使拿不到完整日志，也能通过 check-run annotations API 读到失败位置。
-trap 'rc=$?; echo "::error title=build_apk.sh failed::exit=$rc line=$LINENO cmd=$BASH_COMMAND"; exit $rc' ERR
+# 存成变量，便于在「自己处理错误」的管道前后临时关闭再恢复。
+ERR_TRAP='rc=$?; echo "::error title=build_apk.sh failed::exit=$rc line=$LINENO cmd=$BASH_COMMAND"; exit $rc'
+trap "$ERR_TRAP" ERR
 
 # 外部命令的输出同时打到日志并留存文件；失败时把尾部内容作为注解发出。
 # 这样即使拿不到完整 Actions 日志（下载需要管理员权限），也能通过
@@ -79,6 +81,19 @@ if [[ -n "$ANDROID_REQ" && -f "$ANDROID_REQ" ]]; then
 else
   echo "未找到 requirements-android.txt，改为安装已知依赖"
   python3 -m pip install jinja2 pkginfo tqdm "packaging==24.1"
+fi
+
+# pyside6-android-deploy 的 install() 会拿 [python] android_packages 里钉的版本
+# 和当前环境比对，不一致时它自己跑 pip install（写法里带了 --force）。
+# 先照它自己的 default.spec 把版本装准，避免走它那条不确定的路径。
+DEFAULT_SPEC="$(python3 -c 'import PySide6.scripts.deploy_lib as d, os; print(os.path.join(os.path.dirname(d.__file__), "default.spec"))' 2>/dev/null || true)"
+if [[ -n "$DEFAULT_SPEC" && -f "$DEFAULT_SPEC" ]]; then
+  ANDROID_PKGS="$(python3 -c 'import configparser, sys; c = configparser.ConfigParser(); c.read(sys.argv[1]); print(c.get("python", "android_packages"))' "$DEFAULT_SPEC" 2>/dev/null || true)"
+  if [[ -n "$ANDROID_PKGS" ]]; then
+    log "预装 android_packages: $ANDROID_PKGS"
+    # shellcheck disable=SC2086
+    python3 -m pip install $(printf '%s' "$ANDROID_PKGS" | tr ',' ' ')
+  fi
 fi
 
 # ---------------------------------------------------------------- 下载 wheel
@@ -175,10 +190,14 @@ if [[ ! -f "$PROJECT_DIR/pysidedeploy.spec" ]]; then
   if [[ -n "$SDK_PATH" ]]; then INIT_ARGS+=(--sdk-path "$SDK_PATH"); fi
 
   INIT_LOG="$WORK_DIR/init.log"
+  # 临时关掉 ERR 陷阱：否则管道一失败它就抢先 exit，
+  # emit_annotation_from_log 就没机会把真正的报错发出来
+  trap - ERR
   set +e
   pyside6-android-deploy "${INIT_ARGS[@]}" 2>&1 | tee "$INIT_LOG"
   INIT_RC=${PIPESTATUS[0]}
   set -e
+  trap "$ERR_TRAP" ERR
   if [[ $INIT_RC -ne 0 ]]; then
     emit_annotation_from_log "pyside6-android-deploy --init failed (rc=$INIT_RC)" "$INIT_LOG" 25
     exit $INIT_RC
@@ -196,6 +215,7 @@ python3 "$SCRIPT_DIR/patch_spec.py" "$PROJECT_DIR/pysidedeploy.spec" "$PROJECT_D
 # ---------------------------------------------------------------- 开始打包
 log "开始构建 APK（首次构建需要编译 CPython 与 Qt 依赖，耗时较长）"
 BUILD_LOG="$WORK_DIR/build.log"
+trap - ERR
 set +e
 pyside6-android-deploy \
   --config-file "$PROJECT_DIR/pysidedeploy.spec" \
@@ -205,8 +225,9 @@ pyside6-android-deploy \
   --force 2>&1 | tee "$BUILD_LOG"
 BUILD_RC=${PIPESTATUS[0]}
 set -e
+trap "$ERR_TRAP" ERR
 if [[ $BUILD_RC -ne 0 ]]; then
-  emit_annotation_from_log "pyside6-android-deploy build failed (rc=$BUILD_RC)" "$BUILD_LOG" 40
+  emit_annotation_from_log "pyside6-android-deploy build failed (rc=$BUILD_RC)" "$BUILD_LOG" 45
   exit $BUILD_RC
 fi
 
