@@ -163,6 +163,13 @@ if [[ -z "$NDK_PATH" ]]; then
   NDK_PATH="$(find "$CACHE_DIR" -maxdepth 5 -type d -name toolchains 2>/dev/null | head -n 1 || true)"
   NDK_PATH="${NDK_PATH%/toolchains}"
 fi
+if [[ -z "$NDK_PATH" ]]; then
+  # 兜底：直接找 android-ndk-* 目录
+  NDK_PATH="$(find "$CACHE_DIR" -maxdepth 3 -type d -name 'android-ndk*' 2>/dev/null | head -n 1 || true)"
+fi
+if [[ -z "$NDK_PATH" ]]; then
+  die "在 $CACHE_DIR 下找不到 Android NDK。检查 SDK/NDK 下载步骤，或用 ANDROID_NDK_PATH 显式指定。"
+fi
 if [[ -n "$SDK_PATH" ]]; then
   echo "SDK: $SDK_PATH"
 else
@@ -215,14 +222,19 @@ python3 "$SCRIPT_DIR/patch_spec.py" "$PROJECT_DIR/pysidedeploy.spec" "$PROJECT_D
 # ---------------------------------------------------------------- 开始打包
 log "开始构建 APK（首次构建需要编译 CPython 与 Qt 依赖，耗时较长）"
 BUILD_LOG="$WORK_DIR/build.log"
+# ndk/sdk 必须在命令行上给出：AndroidConfig 会直接拿 AndroidData.ndk_path，
+# 为空时它去调 get_llvm_readobj(None) 就崩了（TypeError: NoneType / str）。
+BUILD_ARGS=(--config-file "$PROJECT_DIR/pysidedeploy.spec"
+            --wheel-pyside "$PYSIDE_WHEEL"
+            --wheel-shiboken "$SHIBOKEN_WHEEL"
+            --keep-deployment-files
+            --force)
+if [[ -n "$NDK_PATH" ]]; then BUILD_ARGS+=(--ndk-path "$NDK_PATH"); fi
+if [[ -n "$SDK_PATH" ]]; then BUILD_ARGS+=(--sdk-path "$SDK_PATH"); fi
+
 trap - ERR
 set +e
-pyside6-android-deploy \
-  --config-file "$PROJECT_DIR/pysidedeploy.spec" \
-  --wheel-pyside "$PYSIDE_WHEEL" \
-  --wheel-shiboken "$SHIBOKEN_WHEEL" \
-  --keep-deployment-files \
-  --force 2>&1 | tee "$BUILD_LOG"
+pyside6-android-deploy "${BUILD_ARGS[@]}" 2>&1 | tee "$BUILD_LOG"
 BUILD_RC=${PIPESTATUS[0]}
 set -e
 trap "$ERR_TRAP" ERR
