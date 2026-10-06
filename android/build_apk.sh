@@ -144,7 +144,17 @@ fi
 log "生成 pysidedeploy.spec"
 cd "$PROJECT_DIR"
 if [[ ! -f "$PROJECT_DIR/pysidedeploy.spec" ]]; then
-  pyside6-android-deploy --init --force
+  # 注意：android_deploy.py 里 --wheel-pyside/--wheel-shiboken 的 required
+  # 取决于「命令行是否给了 -c/--config-file」。这里没给 -c，所以必须显式传 wheel，
+  # 否则 argparse 直接以 exit code 2 退出（--init 也会走同一套参数解析）。
+  INIT_ARGS=(--init --force
+             --wheel-pyside "$PYSIDE_WHEEL"
+             --wheel-shiboken "$SHIBOKEN_WHEEL"
+             --name "CloudFlareScan")
+  # ndk/sdk 的类型是 Path().resolve()，传空字符串会被解析成当前目录，所以仅在非空时传
+  if [[ -n "$NDK_PATH" ]]; then INIT_ARGS+=(--ndk-path "$NDK_PATH"); fi
+  if [[ -n "$SDK_PATH" ]]; then INIT_ARGS+=(--sdk-path "$SDK_PATH"); fi
+  pyside6-android-deploy "${INIT_ARGS[@]}"
 fi
 
 export WHEEL_PYSIDE="$PYSIDE_WHEEL"
@@ -159,6 +169,8 @@ python3 "$SCRIPT_DIR/patch_spec.py" "$PROJECT_DIR/pysidedeploy.spec" "$PROJECT_D
 log "开始构建 APK（首次构建需要编译 CPython 与 Qt 依赖，耗时较长）"
 pyside6-android-deploy \
   --config-file "$PROJECT_DIR/pysidedeploy.spec" \
+  --wheel-pyside "$PYSIDE_WHEEL" \
+  --wheel-shiboken "$SHIBOKEN_WHEEL" \
   --keep-deployment-files \
   --force
 

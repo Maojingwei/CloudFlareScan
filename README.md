@@ -101,7 +101,7 @@ python test_node_share.py
 
 ### 方式二：本地 Linux / macOS 构建
 
-前置条件：JDK 17+、`python3`（3.10+）、`git`、`curl`。
+前置条件：JDK 17+、**Python 3.11（必须 ≤ 3.11，3.12 及以上会被 buildozer 拒绝）**、`git`、`curl`。
 
 ```bash
 python3 -m pip install "PySide6==6.10.3"
@@ -109,9 +109,15 @@ cd CloudFlareScan
 bash android/build_apk.sh
 ```
 
-脚本会自动下载 Android SDK/NDK（缓存到 `~/.pyside6-android-deploy`，约数 GB，仅首次）、
+脚本会自动下载 Android SDK/NDK（缓存到 `~/.pyside6_android_deploy`，约数 GB，仅首次）、
 下载 Qt for Python Android wheel、生成并修正 `pysidedeploy.spec`，最后产出 APK。
 首次构建需要编译 CPython 与依赖，耗时较长（30 分钟以上）。
+
+> 现已确认的坑（都已处理）：
+> - SDK/NDK 缓存目录是 `~/.pyside6_android_deploy`（**下划线**），Qt 文档里写的连字符版本是错的；
+> - `--init` 也必须显式传 `--wheel-pyside/--wheel-shiboken`：这两个参数是否必填取决于命令行有没有 `-c`；
+> - 主机 Python 必须 ≤ 3.11；
+> - `main.py` 必须位于运行命令时的工作目录下（脚本会先 `cd` 到项目根目录）。
 
 常用环境变量：`ANDROID_ARCH`（`aarch64`/`x86_64`）、`BUILDOZER_MODE`（`debug` 出 apk、`release` 出 aab）、
 `ANDROID_NDK_PATH`、`ANDROID_SDK_PATH`。

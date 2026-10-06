@@ -30,7 +30,8 @@ def main() -> int:
     arch = os.environ.get("ANDROID_ARCH", "aarch64")
     mode = os.environ.get("BUILDOZER_MODE", "debug")
 
-    cfg = configparser.ConfigParser(interpolation=None)
+    # strict=False：容忍工具生成出来的 spec 里可能出现的重复键
+    cfg = configparser.ConfigParser(interpolation=None, strict=False)
     # utf-8-sig：兼容带 BOM 的 spec 文件（某些编辑器/PowerShell 会写入 BOM）
     cfg.read(spec_path, encoding="utf-8-sig")
     for section in SECTIONS:
