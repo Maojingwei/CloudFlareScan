@@ -54,6 +54,11 @@ jobs:
           REQ_ANDROID="$(python -c "import PySide6.scripts, os; print(os.path.join(os.path.dirname(PySide6.scripts.__file__), 'requirements-android.txt'))")"
           echo "requirements-android.txt -> $REQ_ANDROID"
           [ -f "$REQ_ANDROID" ] && python -m pip install -r "$REQ_ANDROID" || true
+          # 这里必须显式失败，否则缺少命令时会在后面变成难懂的 exit 127
+          if ! command -v pyside6-android-deploy >/dev/null; then
+            echo "::error::pyside6-android-deploy 未安装"
+            exit 1
+          fi
           pyside6-android-deploy --help >/dev/null && echo "pyside6-android-deploy OK"
 
       # Android SDK/NDK 体积很大（数 GB），缓存后后续构建会快很多
@@ -83,7 +88,7 @@ jobs:
       - name: Cache Qt for Python Android wheels
         uses: actions/cache@v4
         with:
-          path: CloudFlareScan/.android-wheels
+          path: .android-wheels
           key: pyside6-android-wheels-${{ env.QTPY_VERSION }}-${{ inputs.arch || 'aarch64' }}
 
       - name: Build APK
@@ -92,15 +97,21 @@ jobs:
           BUILDOZER_MODE: ${{ inputs.mode || 'debug' }}
         run: |
           set -euo pipefail
-          ls "$HOME/.pyside6-android-deploy" || true
-          bash CloudFlareScan/android/build_apk.sh
+          # 仓库名就叫 CloudFlareScan，检出后文件直接在 workspace 根目录
+          echo "workspace: $GITHUB_WORKSPACE"
+          ls -la
+          echo "--- android/ ---"
+          ls -la android
+          echo "--- SDK/NDK 缓存 ---"
+          ls "$HOME/.pyside6_android_deploy" || true
+          bash android/build_apk.sh
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: CloudFlareScan-android-${{ inputs.arch || 'aarch64' }}
           path: |
-            CloudFlareScan/**/*.apk
-            CloudFlareScan/**/*.aab
+            **/*.apk
+            **/*.aab
           if-no-files-found: error
           retention-days: 30
