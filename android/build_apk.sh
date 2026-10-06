@@ -37,6 +37,10 @@ QT_BASE="https://download.qt.io/official_releases/QtForPython"
 log()  { printf '\n===== %s =====\n' "$*"; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# 任何命令失败时，把「行号 + 失败命令」以 GitHub 注解形式输出。
+# 这样即使拿不到完整日志，也能通过 check-run annotations API 读到失败位置。
+trap 'rc=$?; echo "::error title=build_apk.sh failed::exit=$rc line=$LINENO cmd=$BASH_COMMAND"; exit $rc' ERR
+
 # ---------------------------------------------------------------- 环境检查
 log "检查主机环境"
 case "$(uname -s)" in
@@ -54,7 +58,8 @@ command -v pyside6-android-deploy >/dev/null \
 
 # pyside6-android-deploy 会检查它自带的 requirements-android.txt，缺包会直接退出
 log "安装 pyside6-android-deploy 运行依赖"
-ANDROID_REQ="$(python3 -c "import PySide6.scripts, os; print(os.path.join(os.path.dirname(PySide6.scripts.__file__), 'requirements-android.txt'))" 2>/dev/null || true)"
+# 用单引号包住 -c 的内容，避免嵌套双引号带来的歧义
+ANDROID_REQ="$(python3 -c 'import PySide6.scripts, os; print(os.path.join(os.path.dirname(PySide6.scripts.__file__), "requirements-android.txt"))' 2>/dev/null || true)"
 if [[ -n "$ANDROID_REQ" && -f "$ANDROID_REQ" ]]; then
   python3 -m pip install -r "$ANDROID_REQ"
 else

@@ -34,6 +34,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 放在最前面：脚本若有语法错误，这里几秒内就会失败，
+      # 并把 bash -n 的原始报错（含行号）作为注解输出，便于直接定位。
+      - name: Check build script syntax
+        run: |
+          set -uo pipefail
+          if ! out=$(bash -n android/build_apk.sh 2>&1); then
+            msg="${out//$'\n'/%0A}"
+            echo "::error title=bash syntax error::$msg"
+            exit 1
+          fi
+          echo "android/build_apk.sh syntax OK"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -51,7 +63,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "PySide6==${QTPY_VERSION}" Cython buildozer
           # pyside6-android-deploy 启动时会校验它自带的 requirements-android.txt
-          REQ_ANDROID="$(python -c "import PySide6.scripts, os; print(os.path.join(os.path.dirname(PySide6.scripts.__file__), 'requirements-android.txt'))")"
+          REQ_ANDROID="$(python -c 'import PySide6.scripts, os; print(os.path.join(os.path.dirname(PySide6.scripts.__file__), "requirements-android.txt"))')"
           echo "requirements-android.txt -> $REQ_ANDROID"
           [ -f "$REQ_ANDROID" ] && python -m pip install -r "$REQ_ANDROID" || true
           # 这里必须显式失败，否则缺少命令时会在后面变成难懂的 exit 127
